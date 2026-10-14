@@ -1,0 +1,12 @@
+[Unit]
+Description=Bridge the HFD NUT75 keyboard through uinput (systemd-udevd 259 drops its uevents)
+After=systemd-modules-load.service
+
+[Service]
+ExecStartPre=-/usr/sbin/modprobe uinput
+ExecStart=/usr/local/bin/nut75-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

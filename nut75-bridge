@@ -1,0 +1,247 @@
+#!/usr/bin/python3
+"""Forward the HFD NUT75 keyboard through a clean uinput virtual device.
+
+systemd-udevd >= 259 drops the NUT75's kernel uevents because the keyboard's
+USB serial (UNIQ) contains control bytes. The device then never gets the
+`seat` tag and GNOME/logind refuse to open it. The kernel still creates
+/dev/input/eventN, so this daemon grabs that node and replays its events
+through a uinput device with an empty serial, which udev and GNOME accept.
+
+Usage: nut75-bridge [VID:PID ...]   (default: NUT75 dongle and wired IDs)
+Must run as root (reads /dev/input/event*, writes /dev/uinput).
+"""
+import errno
+import fcntl
+import glob
+import os
+import select
+import struct
+import sys
+import time
+
+DEFAULT_IDS = {(0x0C45, 0xFEF9), (0x0C45, 0x880C)}
+NAME_HINT = "nut75"
+SCAN_INTERVAL = 1.0
+RETRY_INTERVAL = 5.0
+
+EV_SYN, EV_KEY, EV_REL, EV_MSC, EV_LED, EV_REP = 0x00, 0x01, 0x02, 0x04, 0x11, 0x14
+SYN_REPORT = 0
+
+EVENT = struct.Struct("llHHi")  # struct input_event (64-bit timeval)
+
+
+def _ioc(direction, kind, nr, size):
+    return (direction << 30) | (size << 16) | (ord(kind) << 8) | nr
+
+
+def _io(kind, nr):
+    return _ioc(0, kind, nr, 0)
+
+
+def _iow(kind, nr, size):
+    return _ioc(1, kind, nr, size)
+
+
+def _ior(kind, nr, size):
+    return _ioc(2, kind, nr, size)
+
+
+EVIOCGID = _ior("E", 0x02, 8)
+EVIOCGRAB = _iow("E", 0x90, 4)
+
+
+def EVIOCGNAME(size):
+    return _ior("E", 0x06, size)
+
+
+def EVIOCGBIT(ev, size):
+    return _ior("E", 0x20 + ev, size)
+
+
+UI_DEV_CREATE = _io("U", 1)
+UI_DEV_SETUP = _iow("U", 3, 92)  # struct uinput_setup
+UI_SET_EVBIT = _iow("U", 100, 4)
+UI_SET_BIT = {
+    EV_KEY: _iow("U", 101, 4),
+    EV_REL: _iow("U", 102, 4),
+    EV_MSC: _iow("U", 104, 4),
+    EV_LED: _iow("U", 105, 4),
+}
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_sysfs(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def bits(fd, ev, size=96):
+    buf = fcntl.ioctl(fd, EVIOCGBIT(ev, size), bytes(size))
+    return [i for i in range(size * 8) if buf[i // 8] & (1 << (i % 8))]
+
+
+class Bridge:
+    def __init__(self, path):
+        self.path = path
+        self.src = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.ui = None
+        try:
+            self._setup()
+        except Exception:
+            self.close()
+            raise
+
+    def _setup(self):
+        ev_types = set(bits(self.src, 0, 4))
+        if EV_KEY not in ev_types and EV_REL not in ev_types:
+            raise ValueError("no keys or relative axes")
+        name = fcntl.ioctl(self.src, EVIOCGNAME(256), bytes(256)).split(b"\0")[0]
+        bustype, vendor, product, version = struct.unpack(
+            "HHHH", fcntl.ioctl(self.src, EVIOCGID, bytes(8))
+        )
+
+        self.ui = os.open("/dev/uinput", os.O_RDWR | os.O_NONBLOCK)
+        for ev, setbit in UI_SET_BIT.items():
+            if ev in ev_types:
+                fcntl.ioctl(self.ui, UI_SET_EVBIT, ev)
+                for code in bits(self.src, ev):
+                    fcntl.ioctl(self.ui, setbit, code)
+        if EV_REP in ev_types:
+            fcntl.ioctl(self.ui, UI_SET_EVBIT, EV_REP)
+
+        ui_name = (name[:70] + b" (bridge)")[:79]
+        setup = struct.pack("HHHH80sI", bustype, vendor, product, version, ui_name, 0)
+        fcntl.ioctl(self.ui, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.ui, UI_DEV_CREATE)
+        # Grab last so the keyboard is never left grabbed without a replacement.
+        fcntl.ioctl(self.src, EVIOCGRAB, 1)
+        self.name = name.decode("utf-8", "replace")
+        log(f"bridging {self.path} ({self.name}, {vendor:04x}:{product:04x})")
+
+    def forward_input(self):
+        """Copy events from the keyboard to the virtual device. False if gone."""
+        try:
+            data = os.read(self.src, EVENT.size * 64)
+        except BlockingIOError:
+            return True
+        except OSError as e:
+            if e.errno == errno.ENODEV:
+                return False
+            raise
+        if not data:
+            return False
+        os.write(self.ui, data)
+        return True
+
+    def forward_leds(self):
+        """Copy LED state (Caps/Num Lock) set by GNOME back to the keyboard."""
+        try:
+            data = os.read(self.ui, EVENT.size * 16)
+        except BlockingIOError:
+            return
+        out = bytearray()
+        for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, ev, code, value = EVENT.unpack_from(data, off)
+            if ev == EV_LED:
+                out += EVENT.pack(0, 0, EV_LED, code, value)
+        if out:
+            out += EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0)
+            try:
+                os.write(self.src, bytes(out))
+            except OSError:
+                pass
+
+    def close(self):
+        for fd in (self.src, self.ui):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.src = self.ui = None
+
+
+def find_devices(ids):
+    found = []
+    for sys_path in sorted(glob.glob("/sys/class/input/event*")):
+        dev = os.path.realpath(os.path.join(sys_path, "device"))
+        if "/virtual/" in dev:  # our own uinput devices
+            continue
+        try:
+            vid = int(read_sysfs(f"{dev}/id/vendor"), 16)
+            pid = int(read_sysfs(f"{dev}/id/product"), 16)
+        except ValueError:
+            continue
+        name = read_sysfs(f"{dev}/name").lower()
+        if (vid, pid) in ids or (ids is DEFAULT_IDS and NAME_HINT in name):
+            found.append("/dev/input/" + os.path.basename(sys_path))
+    return found
+
+
+def parse_ids(args):
+    if not args:
+        return DEFAULT_IDS
+    ids = set()
+    for arg in args:
+        vid, pid = arg.split(":")
+        ids.add((int(vid, 16), int(pid, 16)))
+    return ids
+
+
+def main():
+    ids = parse_ids(sys.argv[1:])
+    bridges = {}  # /dev/input/eventN -> Bridge
+    failed = {}  # /dev/input/eventN -> time of last failure
+    last_scan = 0.0
+    log("nut75-bridge started, watching " + ", ".join(f"{v:04x}:{p:04x}" for v, p in sorted(ids)))
+
+    while True:
+        now = time.monotonic()
+        if now - last_scan >= SCAN_INTERVAL:
+            last_scan = now
+            present = set(find_devices(ids))
+            for path in list(bridges):
+                if path not in present:
+                    log(f"{path} removed")
+                    bridges.pop(path).close()
+            for path in present - bridges.keys():
+                if now - failed.get(path, -RETRY_INTERVAL) < RETRY_INTERVAL:
+                    continue
+                try:
+                    bridges[path] = Bridge(path)
+                    failed.pop(path, None)
+                except ValueError:
+                    failed[path] = now  # e.g. an interface with only absolute axes
+                except OSError as e:
+                    failed[path] = now
+                    log(f"cannot bridge {path}: {e}")
+
+        by_fd = {}
+        for b in bridges.values():
+            by_fd[b.src] = (b, True)
+            by_fd[b.ui] = (b, False)
+        ready, _, _ = select.select(list(by_fd), [], [], SCAN_INTERVAL)
+        for fd in ready:
+            b, is_src = by_fd[fd]
+            if b.src is None:
+                continue
+            if is_src:
+                if not b.forward_input():
+                    log(f"{b.path} disconnected")
+                    b.close()
+                    bridges.pop(b.path, None)
+            else:
+                b.forward_leds()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
